@@ -202,6 +202,7 @@ pub(crate) async fn deserialize_async<R: ClickHouseRead>(
     rows: usize,
     nulls: &[u8],
 ) -> Result<ArrayRef> {
+    println!("[DEBUG] deserializing binary column. Type: {:?}, Rows: {}", type_hint, rows);
     type B = TypedBuilder;
 
     // Use pattern matching on the builder to deserialize the appropriate type
