@@ -244,11 +244,15 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             }
 
             println!("[DEBUG] Protocol Revision: {}", revision);
-            let _has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
-                reader.read_u8().await? != 0
-            } else {
-                false
-            };
+            if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
+                let has_custom = reader.read_u8().await?;
+                if has_custom != 0 {
+                    // Try to consume the version marker (VarInt) to realign
+                    tracing::warn!("Custom serialization detected for column {}. Attempting to skip metadata.", field.name());
+                    // We read one VarInt and discard it.
+                    let _ = reader.read_var_uint().await?;
+                }
+            }
 
             let array = if rows > 0 {
                 let dt = field.data_type();
