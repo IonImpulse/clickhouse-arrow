@@ -194,7 +194,6 @@ macro_rules! binary_async {
 ///     assert_eq!(array.as_ref(), expected.as_ref());
 /// }
 /// ```
-// arrow/deserialize/binary.rs
 
 pub(crate) async fn deserialize_async<R: ClickHouseRead>(
     type_hint: &Type,
@@ -211,15 +210,34 @@ pub(crate) async fn deserialize_async<R: ClickHouseRead>(
         match type_hint.strip_null() {
             Type::FixedSizedString(n) | Type::FixedSizedBinary(n) => {
                 for i in 0..rows {
-                    // 1. Read fixed bytes
                     let bytes = binary_async!(FixedBinary(*n) => reader);
-                    // 2. Convert to UTF-8 (lossy)
                     let val = String::from_utf8_lossy(&bytes);
                     super::opt_value!(b, i, nulls, val.as_ref());
                 }
             },
+            Type::Ipv4 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Ipv4 => reader);
+                    let val = std::net::Ipv4Addr::from(bytes).to_string();
+                    super::opt_value!(b, i, nulls, val.as_str());
+                }
+            },
+            Type::Ipv6 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Ipv6 => reader);
+                    let val = std::net::Ipv6Addr::from(bytes).to_string();
+                    super::opt_value!(b, i, nulls, val.as_str());
+                }
+            },
+            Type::Uuid => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Fixed(16) => reader);
+                    // Ensure uuid crate is available or use a byte formatter
+                    let val = uuid::Uuid::from_bytes(bytes).to_string();
+                    super::opt_value!(b, i, nulls, val.as_str());
+                }
+            },
             _ => {
-                // Standard String (VarUInt length + bytes)
                 for i in 0..rows {
                    super::opt_value!(b, i, nulls, binary_async!(String => reader));
                 }
@@ -235,8 +253,31 @@ pub(crate) async fn deserialize_async<R: ClickHouseRead>(
                     super::opt_value!(b, i, nulls, bytes);
                 }
             },
+            Type::Ipv4 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Ipv4 => reader);
+                    super::opt_value!(b, i, nulls, bytes);
+                }
+            },
+            Type::Ipv6 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Ipv6 => reader);
+                    super::opt_value!(b, i, nulls, bytes);
+                }
+            },
+            Type::Uuid | Type::Int128 | Type::UInt128 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(Fixed(16) => reader);
+                    super::opt_value!(b, i, nulls, bytes);
+                }
+            },
+            Type::Int256 | Type::UInt256 => {
+                for i in 0..rows {
+                    let bytes = binary_async!(FixedRev(32) => reader);
+                    super::opt_value!(b, i, nulls, bytes);
+                }
+            },
             _ => {
-                // Standard Binary (VarUInt length + bytes)
                 for i in 0..rows {
                    super::opt_value!(b, i, nulls, binary_async!(Binary => reader));
                 }
