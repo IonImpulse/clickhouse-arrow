@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::array::{Array, new_empty_array};
+use arrow::array::{Array, UInt64Array, new_empty_array};
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -243,6 +243,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 trace!(?field, ?type_hint, ?options, "deserializing column {i}");
             }
 
+            println!("[DEBUG] Protocol Revision: {}", revision);
             let _has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 reader.read_u8().await? != 0
             } else {
@@ -272,6 +273,12 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             } else {
                 new_empty_array(field.data_type())
             };
+
+            if let Some(uint_array) = array.as_any().downcast_ref::<UInt64Array>() {
+                if uint_array.len() > 0 {
+                    println!("[DEBUG] Read event_type value: {}", uint_array.value(0));
+                }
+            }
 
             let _ = deser.push_array(array).push_field(Arc::new(field));
         }
