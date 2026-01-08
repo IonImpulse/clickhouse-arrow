@@ -221,14 +221,15 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
         let _ = deser.with_capacity(columns, rows);
 
         for i in 0..columns {
-            let name = reader.read_utf8_string().await?;
-            let type_name = reader.read_utf8_string().await?;
             println!("--------------------------------------------------");
             println!("[DEBUG] Column Index: {}", i);
+            let name = reader.read_utf8_string().await?;
             println!("[DEBUG] Column Name : '{}'", name);
+            let type_name = reader.read_utf8_string().await?;
             println!("[DEBUG] CH Type Raw : '{}'", type_name);
 
             let internal_type = Type::from_str(&type_name)?;
+            println!("[DEBUG] CH Type Internal : '{}'", internal_type);
             let (arrow_type, is_nullable) = internal_type.arrow_type(Some(options))?;
 
             // Verify the resulting type against the arrow type, otherwise the builders will fail
