@@ -194,6 +194,8 @@ macro_rules! binary_async {
 ///     assert_eq!(array.as_ref(), expected.as_ref());
 /// }
 /// ```
+// arrow/deserialize/binary.rs
+
 pub(crate) async fn deserialize_async<R: ClickHouseRead>(
     type_hint: &Type,
     builder: &mut TypedBuilder,
@@ -206,14 +208,39 @@ pub(crate) async fn deserialize_async<R: ClickHouseRead>(
     // Use pattern matching on the builder to deserialize the appropriate type
     Ok(super::deser!(() => builder => {
     B::String(b) => {{
-        for i in 0..rows {
-           super::opt_value!(b, i, nulls, binary_async!(String => reader));
+        match type_hint.strip_null() {
+            Type::FixedSizedString(n) | Type::FixedSizedBinary(n) => {
+                for i in 0..rows {
+                    // 1. Read fixed bytes
+                    let bytes = binary_async!(FixedBinary(*n) => reader);
+                    // 2. Convert to UTF-8 (lossy)
+                    let val = String::from_utf8_lossy(&bytes);
+                    super::opt_value!(b, i, nulls, val.as_ref());
+                }
+            },
+            _ => {
+                // Standard String (VarUInt length + bytes)
+                for i in 0..rows {
+                   super::opt_value!(b, i, nulls, binary_async!(String => reader));
+                }
+            }
         }
         Arc::new(b.finish())
     }},
     B::Binary(b) => {{
-        for i in 0..rows {
-           super::opt_value!(b, i, nulls, binary_async!(Binary => reader));
+        match type_hint.strip_null() {
+            Type::FixedSizedString(n) | Type::FixedSizedBinary(n) => {
+                for i in 0..rows {
+                    let bytes = binary_async!(FixedBinary(*n) => reader);
+                    super::opt_value!(b, i, nulls, bytes);
+                }
+            },
+            _ => {
+                // Standard Binary (VarUInt length + bytes)
+                for i in 0..rows {
+                   super::opt_value!(b, i, nulls, binary_async!(Binary => reader));
+                }
+            }
         }
         Arc::new(b.finish())
     }},
