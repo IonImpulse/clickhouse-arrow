@@ -247,10 +247,12 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 let has_custom = reader.read_u8().await?;
                 if has_custom != 0 {
-                    // Try to consume the version marker (VarInt) to realign
-                    tracing::warn!("Custom serialization detected for column {}. Attempting to skip metadata.", field.name());
-                    // We read one VarInt and discard it.
-                    let _ = reader.read_var_uint().await?;
+                    let custom_name = reader.read_utf8_string().await?;
+                    tracing::warn!(
+                        "Custom serialization detected for column '{}': '{}'. Data might be compressed/sparse.", 
+                        field.name(), 
+                        custom_name
+                    );
                 }
             }
 
