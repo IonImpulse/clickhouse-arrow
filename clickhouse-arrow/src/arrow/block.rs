@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::array::{Array, new_empty_array};
+use arrow::array::{Array, UInt64Array, new_empty_array};
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -235,11 +235,47 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 trace!(?field, ?type_hint, ?options, "deserializing column {i}");
             }
 
-            let _has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
+            let has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 reader.read_u8().await? != 0
             } else {
                 false
             };
+
+            if has_custom {
+                let name = reader.read_utf8_string().await?;
+                if name == "Sparse" {
+                    // 1. Initialize builder immediately (similar to standard path)
+                    let dt = field.data_type();
+                    let builders = &mut deser.builders;
+                    let builder = if let Some(b) = builders.get_mut(i) {
+                        b
+                    } else {
+                        builders.push(TypedBuilder::try_new(&type_hint, dt)?);
+                        builders.last_mut().unwrap()
+                    };
+
+                    // 2. Delegate to sparse deserializer
+                    let row_buffer = &mut deser.buffer;
+                    // For now, assume Sparse wraps the whole column logic.
+                    deserialize_sparse_async(builder, reader, &type_hint, dt, rows, row_buffer)
+                        .await?;
+
+                    // 3. Push result
+                    let array = builder.finish();
+                    let _ = deser.push_array(array).push_field(Arc::new(field));
+
+                    // 4. Continue to next column loop
+                    continue;
+                } else {
+                    tracing::warn!("Unsupported custom serialization: {}", name);
+                    // If we can't read it, we are likely desynced.
+                    // Ideally we should return error or try to skip bytes if length is known (it usually isn't easily).
+                    return Err(Error::ArrowDeserialize(format!(
+                        "Unsupported custom serialization: {}",
+                        name
+                    )));
+                }
+            }
 
             let array = if rows > 0 {
                 let dt = field.data_type();
@@ -342,6 +378,91 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
     }
 }
 
+pub async fn deserialize_sparse_async<R: ClickHouseRead>(
+    target_builder: &mut TypedBuilder,
+    reader: &mut R,
+    type_hint: &Type,
+    arrow_type: &DataType,
+    total_rows: usize,
+    rbuffer: &mut Vec<u8>,
+) -> Result<()> {
+    // 1. Read Sparse Serialization Header
+    // The format starts with version (u64)
+    let _version = reader.read_u64_le().await?; 
+    
+    // 2. Read count of non-default values stored
+    let element_count = reader.read_u64_le().await? as usize;
+
+    // 3. Deserialize Indices (always UInt64)
+    // We create a temporary builder for UInt64
+    let indices_type = Type::UInt64;
+    let mut indices_builder = TypedBuilder::try_new(&indices_type, &DataType::UInt64)?;
+    
+    // Use the standard deserializer for the indices column
+    indices_type.deserialize_arrow_async(
+        &mut indices_builder, 
+        reader, 
+        &DataType::UInt64, 
+        element_count, 
+        &[], 
+        rbuffer
+    ).await?;
+    
+    let indices_array_ref = indices_builder.finish();
+    let indices = indices_array_ref.as_any().downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::ArrowDeserialize("Failed to cast sparse indices to UInt64Array".into()))?;
+
+    // 4. Deserialize Values
+    // The "Values" part is a dense array of `element_count` items.
+    // Note: If the column is Nullable(T), the "default" is NULL. 
+    // The "values" array here represents the non-default values.
+    // However, the deserialization of the values column itself must respect the type_hint.
+    
+    let mut values_builder = TypedBuilder::try_new(type_hint, arrow_type)?;
+    
+    type_hint.deserialize_arrow_async(
+        &mut values_builder, 
+        reader, 
+        arrow_type, 
+        element_count, 
+        &[], // No null mask for the compressed block usually, it's self contained
+        rbuffer
+    ).await?;
+    
+    let values_array = values_builder.finish();
+
+    // 5. Inflate (Scatter) into Target Builder
+    // We iterate from 0 to total_rows. 
+    // If the current row index matches the next index in `indices`, we take a value.
+    // Otherwise, we push a default.
+
+    let is_nullable = matches!(type_hint, Type::Nullable(_));
+    let mut current_sparse_idx = 0;
+    
+    for row_idx in 0..total_rows {
+        // Check if the current row exists in the sparse data
+        let has_value = if current_sparse_idx < element_count {
+            // ClickHouse indices are 0-based
+            indices.value(current_sparse_idx) as usize == row_idx
+        } else {
+            false
+        };
+
+        if has_value {
+            // Push value from values_array
+            target_builder.push_from_array(&values_array, current_sparse_idx)?;
+            current_sparse_idx += 1;
+        } else {
+            // Push default value
+            // If Nullable(T), default is NULL.
+            // If T, default is 0/empty.
+            target_builder.push_default(is_nullable)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -363,10 +484,13 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob")])),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob")])),
+            ],
+        )
         .unwrap()
     }
 
@@ -509,11 +633,11 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_single_column_int32() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default();
         let mut buffer = Cursor::new(Vec::new());
@@ -598,9 +722,10 @@ mod tests {
             deserialized_values.values().as_ref(),
             Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])).as_ref()
         );
-        assert_eq!(deserialized_values.offsets().iter().copied().collect::<Vec<i32>>(), vec![
-            0, 2, 3, 5
-        ]);
+        assert_eq!(
+            deserialized_values.offsets().iter().copied().collect::<Vec<i32>>(),
+            vec![0, 2, 3, 5]
+        );
     }
 
     /// Tests round-trip serialization and deserialization of a `RecordBatch` with a Map column.
@@ -660,18 +785,20 @@ mod tests {
             struct_array.column(1).as_any().downcast_ref::<Int32Array>().unwrap(),
             &Int32Array::from(vec![1, 2, 3, 4, 5])
         );
-        assert_eq!(deserialized_map.offsets().iter().copied().collect::<Vec<i32>>(), vec![
-            0, 2, 3, 5
-        ]);
+        assert_eq!(
+            deserialized_map.offsets().iter().copied().collect::<Vec<i32>>(),
+            vec![0, 2, 3, 5]
+        );
     }
 
     /// Tests round-trip serialization and deserialization of a `RecordBatch` with zero rows.
     #[tokio::test]
     async fn test_round_trip_zero_rows() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(
-            Vec::<i32>::new(),
-        ))])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -738,11 +865,11 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_with_header() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
         let header = vec![("id".to_string(), Type::Int32)];
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -777,13 +904,11 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_strings_as_binary() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Binary, true)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(BinaryArray::from(vec![
-                Some(b"a" as &[u8]),
-                None,
-                Some(b"c" as &[u8]),
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from(vec![Some(b"a" as &[u8]), None, Some(b"c" as &[u8])]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(false);
         let mut buffer = Cursor::new(Vec::new());
@@ -817,11 +942,11 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_float64() {
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Float64, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Float64Array::from(vec![
-                1.5, -2.0, 3.1,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![1.5, -2.0, 3.1]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Cursor::new(Vec::new());
@@ -859,10 +984,13 @@ mod tests {
             DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
             true,
         )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            TimestampSecondArray::from(vec![Some(1000), None, Some(3000)])
-                .with_timezone_opt(Some("UTC")),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![Some(1000), None, Some(3000)])
+                    .with_timezone_opt(Some("UTC")),
+            )],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -902,11 +1030,14 @@ mod tests {
     async fn test_round_trip_decimal128() {
         let schema =
             Arc::new(Schema::new(vec![Field::new("price", DataType::Decimal128(18, 4), false)]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            Decimal128Array::from(vec![10000, 20000, 30000])
-                .with_precision_and_scale(18, 4)
-                .unwrap(),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                Decimal128Array::from(vec![10000, 20000, 30000])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+            )],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -950,11 +1081,11 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-                DictionaryArray::<Int32Type>::from_iter(vec!["cat", "dog", "cat"]),
-            )])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(DictionaryArray::<Int32Type>::from_iter(vec!["cat", "dog", "cat"]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Cursor::new(Vec::new());
@@ -994,9 +1125,12 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int8Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1116,9 +1250,12 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int8Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1166,9 +1303,12 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int16Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int16Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1215,11 +1355,13 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-                DictionaryArray::<Int32Type>::from_iter(vec!["active", "inactive", "active"]),
-            )])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(DictionaryArray::<Int32Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Cursor::new(Vec::new());
@@ -1348,12 +1490,14 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_non_utf8_binary() {
         let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Binary, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(BinaryArray::from_vec(vec![
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from_vec(vec![
                 b"\xFF\xFE" as &[u8], // Non-UTF-8
                 b"\x00\x01" as &[u8],
-            ]))])
-            .unwrap();
+            ]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(false);
         let mut buffer = Cursor::new(Vec::new());
@@ -1388,13 +1532,11 @@ mod tests {
     #[tokio::test]
     async fn test_round_trip_max_min_int32() {
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                i32::MIN,
-                0,
-                i32::MAX,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![i32::MIN, 0, i32::MAX]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Cursor::new(Vec::new());
@@ -1427,11 +1569,11 @@ mod tests {
     #[tokio::test]
     async fn test_header_type_mismatch() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
         let header = vec![("id".to_string(), Type::String)]; // Mismatch: Int32 vs String
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1456,14 +1598,17 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             true,
         )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![Some(0), Some(3), Some(1), None, Some(2)]),
-                Arc::new(StringArray::from(vec!["active", "inactive", "pending", "absent"]))
-                    as ArrayRef,
-            )
-            .unwrap(),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![Some(0), Some(3), Some(1), None, Some(2)]),
+                    Arc::new(StringArray::from(vec!["active", "inactive", "pending", "absent"]))
+                        as ArrayRef,
+                )
+                .unwrap(),
+            )],
+        )
         .expect("Failed to create RecordBatch");
 
         let mut writer = Cursor::new(Vec::new());
@@ -1560,10 +1705,13 @@ mod tests_sync {
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob")])),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("alice"), None, Some("bob")])),
+            ],
+        )
         .unwrap()
     }
 
@@ -1685,11 +1833,11 @@ mod tests_sync {
     #[test]
     fn test_round_trip_single_column_int32() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default();
         let mut buffer = Vec::new();
@@ -1758,9 +1906,10 @@ mod tests_sync {
             deserialized_values.values().as_ref(),
             Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])).as_ref()
         );
-        assert_eq!(deserialized_values.offsets().iter().copied().collect::<Vec<i32>>(), vec![
-            0, 2, 3, 5
-        ]);
+        assert_eq!(
+            deserialized_values.offsets().iter().copied().collect::<Vec<i32>>(),
+            vec![0, 2, 3, 5]
+        );
     }
 
     /// Tests round-trip serialization and deserialization of a `RecordBatch` with a Map column.
@@ -1811,18 +1960,20 @@ mod tests_sync {
             struct_array.column(1).as_any().downcast_ref::<Int32Array>().unwrap(),
             &Int32Array::from(vec![1, 2, 3, 4, 5])
         );
-        assert_eq!(deserialized_map.offsets().iter().copied().collect::<Vec<i32>>(), vec![
-            0, 2, 3, 5
-        ]);
+        assert_eq!(
+            deserialized_map.offsets().iter().copied().collect::<Vec<i32>>(),
+            vec![0, 2, 3, 5]
+        );
     }
 
     /// Tests round-trip serialization and deserialization of a `RecordBatch` with zero rows.
     #[test]
     fn test_round_trip_zero_rows() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(
-            Vec::<i32>::new(),
-        ))])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1871,11 +2022,11 @@ mod tests_sync {
     #[test]
     fn test_round_trip_with_header() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
 
         let header = vec![("id".to_string(), Type::Int32)];
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -1904,13 +2055,11 @@ mod tests_sync {
     #[test]
     fn test_round_trip_strings_as_binary() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Binary, true)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(BinaryArray::from(vec![
-                Some(b"a" as &[u8]),
-                None,
-                Some(b"c" as &[u8]),
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from(vec![Some(b"a" as &[u8]), None, Some(b"c" as &[u8])]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(false);
         let mut buffer = Vec::new();
@@ -1935,11 +2084,11 @@ mod tests_sync {
     #[test]
     fn test_round_trip_float64() {
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Float64, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Float64Array::from(vec![
-                1.5, -2.0, 3.1,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![1.5, -2.0, 3.1]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Vec::new();
@@ -1968,10 +2117,13 @@ mod tests_sync {
             DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
             true,
         )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            TimestampSecondArray::from(vec![Some(1000), None, Some(3000)])
-                .with_timezone_opt(Some("UTC")),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                TimestampSecondArray::from(vec![Some(1000), None, Some(3000)])
+                    .with_timezone_opt(Some("UTC")),
+            )],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2002,11 +2154,14 @@ mod tests_sync {
     fn test_round_trip_decimal128() {
         let schema =
             Arc::new(Schema::new(vec![Field::new("price", DataType::Decimal128(18, 4), false)]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            Decimal128Array::from(vec![10000, 20000, 30000])
-                .with_precision_and_scale(18, 4)
-                .unwrap(),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                Decimal128Array::from(vec![10000, 20000, 30000])
+                    .with_precision_and_scale(18, 4)
+                    .unwrap(),
+            )],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2041,11 +2196,11 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-                DictionaryArray::<Int32Type>::from_iter(vec!["cat", "dog", "cat"]),
-            )])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(DictionaryArray::<Int32Type>::from_iter(vec!["cat", "dog", "cat"]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Vec::new();
@@ -2076,9 +2231,12 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int8Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2183,9 +2341,12 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int8Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int8Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2227,9 +2388,12 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(
-            DictionaryArray::<Int16Type>::from_iter(vec!["active", "inactive", "active"]),
-        )])
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(DictionaryArray::<Int16Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
         .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2267,11 +2431,13 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-                DictionaryArray::<Int32Type>::from_iter(vec!["active", "inactive", "active"]),
-            )])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(DictionaryArray::<Int32Type>::from_iter(vec![
+                "active", "inactive", "active",
+            ]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Vec::new();
@@ -2373,12 +2539,14 @@ mod tests_sync {
     #[test]
     fn test_round_trip_non_utf8_binary() {
         let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Binary, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(BinaryArray::from_vec(vec![
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from_vec(vec![
                 b"\xFF\xFE" as &[u8], // Non-UTF-8
                 b"\x00\x01" as &[u8],
-            ]))])
-            .unwrap();
+            ]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(false);
         let mut buffer = Vec::new();
@@ -2404,13 +2572,11 @@ mod tests_sync {
     #[test]
     fn test_round_trip_max_min_int32() {
         let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                i32::MIN,
-                0,
-                i32::MAX,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![i32::MIN, 0, i32::MAX]))],
+        )
+        .unwrap();
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
         let mut buffer = Vec::new();
@@ -2434,11 +2600,11 @@ mod tests_sync {
     #[test]
     fn test_header_type_mismatch() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![
-                1, 2, 3,
-            ]))])
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
         let header = vec![("id".to_string(), Type::String)]; // Mismatch: Int32 vs String
 
         let arrow_options = ArrowOptions::default().with_strings_as_strings(true);
@@ -2465,14 +2631,17 @@ mod tests_sync {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             true,
         )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![Some(0), Some(3), Some(1), None, Some(2)]),
-                Arc::new(StringArray::from(vec!["active", "inactive", "pending", "absent"]))
-                    as ArrayRef,
-            )
-            .unwrap(),
-        )])
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![Some(0), Some(3), Some(1), None, Some(2)]),
+                    Arc::new(StringArray::from(vec!["active", "inactive", "pending", "absent"]))
+                        as ArrayRef,
+                )
+                .unwrap(),
+            )],
+        )
         .expect("Failed to create RecordBatch");
 
         let mut writer = Vec::new();

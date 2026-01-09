@@ -286,6 +286,186 @@ impl TypedBuilder {
             ),
         }))
     }
+
+    // NEW: Helper to append a default value (0, empty, or NULL)
+    pub(crate) fn push_default(&mut self, is_nullable: bool) -> Result<()> {
+        if is_nullable {
+            // If the column is Nullable, the "default" value in Sparse encoding is NULL.
+            // We delegate to the specific builder's null appender.
+            return self.append_null();
+        }
+
+        // If not nullable, we append the type-specific default (0, "", etc.)
+        match self {
+            // Primitives
+            Self::Int8(b) => b.append_value(0),
+            Self::Int16(b) => b.append_value(0),
+            Self::Int32(b) => b.append_value(0),
+            Self::Int64(b) => b.append_value(0),
+            Self::UInt8(b) => b.append_value(0),
+            Self::UInt16(b) => b.append_value(0),
+            Self::UInt32(b) => b.append_value(0),
+            Self::UInt64(b) => b.append_value(0),
+            Self::Float32(b) => b.append_value(0.0),
+            Self::Float64(b) => b.append_value(0.0),
+            
+            // Decimal (0 value)
+            Self::Decimal32(b) 
+            | Self::Decimal64(b) 
+            | Self::Decimal128(b) => b.append_value(0),
+
+            // Date/Time (Epoch 0)
+            Self::Date(b) | Self::Date32(b) => b.append_value(0),
+            Self::DateTime(b) => b.append_value(0),
+            Self::DateTimeS(b) => b.append_value(0),
+            Self::DateTimeMs(b) => b.append_value(0),
+            Self::DateTimeMu(b) => b.append_value(0),
+            Self::DateTimeNano(b) => b.append_value(0),
+
+            // Strings/Binary
+            Self::String(b) | Self::Object(b) => b.append_value(""),
+            Self::Binary(b) => b.append_value(&[]),
+            Self::FixedSizeBinary(b) => b.append_value(&vec![0u8; b.len()])?,
+
+            // Complex Types
+            Self::Map((k, v)) => {
+                // Map default is empty map
+                // In arrow MapBuilder, we append to the null buffer (valid) but add no items
+                // This logic depends on the specific Arrow MapBuilder implementation wrapped in (Box, Box)
+                // For now, simple error or implementation specific to your Map wrapper
+                return Err(Error::ArrowDeserialize("Sparse Map deserialization not fully implemented".into()));
+            }
+            Self::Tuple(builders) => {
+                for builder in builders {
+                    builder.push_default(false)?; // Recursively push defaults
+                }
+            }
+            Self::LowCardinality(b) => {
+                // Depending on implementation, likely index 0
+                // This requires LowCardinalityBuilder to expose a push_default
+                return Err(Error::ArrowDeserialize("Sparse LowCardinality deserialization not implemented".into()));
+            }
+
+            _ => unimplemented!("Not implemented!")
+        }
+        Ok(())
+    }
+
+    fn append_null(&mut self) -> Result<()> {
+        match self {
+            Self::Int8(b) => b.append_null(),
+            Self::Int16(b) => b.append_null(),
+            Self::Int32(b) => b.append_null(),
+            Self::Int64(b) => b.append_null(),
+            Self::UInt8(b) => b.append_null(),
+            Self::UInt16(b) => b.append_null(),
+            Self::UInt32(b) => b.append_null(),
+            Self::UInt64(b) => b.append_null(),
+            Self::Float32(b) => b.append_null(),
+            Self::Float64(b) => b.append_null(),
+            Self::Decimal32(b) 
+            | Self::Decimal64(b) 
+            | Self::Decimal128(b) => b.append_null(),
+            Self::Decimal256(b) => b.append_null(),
+            Self::Date(b) | Self::Date32(b) => b.append_null(),
+            Self::DateTime(b) => b.append_null(),
+            Self::DateTimeS(b) => b.append_null(),
+            Self::DateTimeMs(b) => b.append_null(),
+            Self::DateTimeMu(b) => b.append_null(),
+            Self::DateTimeNano(b) => b.append_null(),
+            Self::String(b) | Self::Object(b) => b.append_null(),
+            Self::Binary(b) => b.append_null(),
+            Self::FixedSizeBinary(b) => b.append_null(),
+            Self::Enum8(b) => b.append_null(),
+            Self::Enum16(b) => b.append_null(),
+            Self::Tuple(builders) => {
+                for builder in builders {
+                    builder.append_null()?;
+                }
+            }
+            _ => return Err(Error::ArrowDeserialize("Unsupported null append for this type".into())),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_from_array(&mut self, source: &ArrayRef, index: usize) -> Result<()> {
+        macro_rules! push_prim {
+            ($builder:expr, $cast_type:ty) => {{
+                let arr = source.as_any().downcast_ref::<$cast_type>()
+                    .ok_or_else(|| Error::ArrowDeserialize(format!("Type mismatch in sparse inflation: expected {}", stringify!($cast_type))))?;
+                if arr.is_null(index) {
+                    $builder.append_null();
+                } else {
+                    $builder.append_value(arr.value(index));
+                }
+            }}
+        }
+
+        match self {
+            Self::Int8(b) => push_prim!(b, Int8Array),
+            Self::Int16(b) => push_prim!(b, Int16Array),
+            Self::Int32(b) => push_prim!(b, Int32Array),
+            Self::Int64(b) => push_prim!(b, Int64Array),
+            Self::UInt8(b) => push_prim!(b, UInt8Array),
+            Self::UInt16(b) => push_prim!(b, UInt16Array),
+            Self::UInt32(b) => push_prim!(b, UInt32Array),
+            Self::UInt64(b) => push_prim!(b, UInt64Array),
+            Self::Float32(b) => push_prim!(b, Float32Array),
+            Self::Float64(b) => push_prim!(b, Float64Array),
+            
+            Self::Decimal32(b) | Self::Decimal64(b) | Self::Decimal128(b) => push_prim!(b, Decimal128Array),
+            Self::Decimal256(b) => push_prim!(b, Decimal256Array),
+
+            Self::Date(b) | Self::Date32(b) => push_prim!(b, Date32Array),
+            
+            Self::DateTime(b) | Self::DateTimeS(b) => push_prim!(b, TimestampSecondArray),
+            Self::DateTimeMs(b) => push_prim!(b, TimestampMillisecondArray),
+            Self::DateTimeMu(b) => push_prim!(b, TimestampMicrosecondArray),
+            Self::DateTimeNano(b) => push_prim!(b, TimestampNanosecondArray),
+
+            Self::String(b) | Self::Object(b) => push_prim!(b, StringArray),
+            Self::Binary(b) => push_prim!(b, BinaryArray),
+            Self::FixedSizeBinary(b) => push_prim!(b, FixedSizeBinaryArray),
+
+            _ => return Err(Error::ArrowDeserialize("Complex sparse copy not implemented".into())),
+        }
+        Ok(())
+    }
+    
+    // NEW: Expose finish helper
+    pub(crate) fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Int8(b) => Arc::new(b.finish()),
+            Self::Int16(b) => Arc::new(b.finish()),
+            Self::Int32(b) => Arc::new(b.finish()),
+            Self::Int64(b) => Arc::new(b.finish()),
+            Self::UInt8(b) => Arc::new(b.finish()),
+            Self::UInt16(b) => Arc::new(b.finish()),
+            Self::UInt32(b) => Arc::new(b.finish()),
+            Self::UInt64(b) => Arc::new(b.finish()),
+            Self::Float32(b) => Arc::new(b.finish()),
+            Self::Float64(b) => Arc::new(b.finish()),
+            Self::Decimal32(b) 
+            | Self::Decimal64(b) 
+            | Self::Decimal128(b) => Arc::new(b.finish()),
+            Self::Decimal256(b) => Arc::new(b.finish()),
+            Self::Date(b) | Self::Date32(b) => Arc::new(b.finish()),
+            Self::DateTime(b)
+            | Self::DateTimeS(b) => Arc::new(b.finish()),
+            Self::DateTimeMs(b) => Arc::new(b.finish()),
+            Self::DateTimeMu(b) => Arc::new(b.finish()),
+            Self::DateTimeNano(b) => Arc::new(b.finish()),
+            Self::String(b) | Self::Object(b) => Arc::new(b.finish()),
+            Self::Binary(b) => Arc::new(b.finish()),
+            Self::FixedSizeBinary(b) => Arc::new(b.finish()),
+            Self::Enum8(b) => Arc::new(b.finish()),
+            Self::Enum16(b) => Arc::new(b.finish()),
+            Self::List(b) => unimplemented!("Finish List"),
+            Self::LowCardinality(b) => unimplemented!("Finish LowCardinality"),
+            Self::Map(_) => unimplemented!("Finish Map"),
+            Self::Tuple(_) => unimplemented!("Finish Tuple"),
+        }
+    }
 }
 
 impl std::fmt::Debug for TypedBuilder {

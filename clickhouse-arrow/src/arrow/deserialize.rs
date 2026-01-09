@@ -18,6 +18,7 @@ mod map;
 mod null;
 mod primitive;
 mod tuple;
+mod sparse;
 
 use std::sync::Arc;
 
