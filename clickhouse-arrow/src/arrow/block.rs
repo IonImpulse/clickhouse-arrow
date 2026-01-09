@@ -246,6 +246,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             println!("[DEBUG] Protocol Revision: {}", revision);
             if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 let has_custom = reader.read_u8().await?;
+                println!("[DEBUG] Has Custom: {}", has_custom);
                 if has_custom != 0 {
                     let custom_name = reader.read_utf8_string().await?;
                     tracing::warn!(
