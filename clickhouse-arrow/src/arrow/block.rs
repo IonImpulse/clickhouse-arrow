@@ -239,48 +239,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             println!("[DEBUG] Arrow Type  : {:?}", arrow_type);
             let field = Field::new(name, arrow_type, is_nullable);
 
-            if debug_arrow() {
-                trace!(?field, ?type_hint, ?options, "deserializing column {i}");
-            }
-
-            println!("\n[DEBUG] !!! DUMPING STREAM AT 'event_type' CUSTOM CHECK !!!");
-            
-            let mut debug_buf = vec![0u8; 64];
-            // We try to read up to 64 bytes to see what is coming next
-            match reader.read(&mut debug_buf).await {
-                Ok(n) => {
-                    println!("Read {} bytes from stream:", n);
-                    println!("      | 00 01 02 03 04 05 06 07 | ASCII");
-                    println!("------+-------------------------+---------");
-                    
-                    for (offset, chunk) in debug_buf[..n].chunks(8).enumerate() {
-                        let hex: String = chunk.iter()
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<Vec<String>>()
-                            .join(" ");
-                        
-                        let ascii: String = chunk.iter()
-                            .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
-                            .collect();
-                        
-                        println!(" {:04} | {:<23} | {}", offset * 8, hex, ascii);
-                    }
-                    println!("------------------------------------------");
-                    
-                    // Analyze the first byte specifically regarding your 0x81 error
-                    if n > 0 {
-                        let b = debug_buf[0];
-                        println!("[ANALYSIS] Next byte is: 0x{:02X} (Decimal: {})", b, b);
-                        if b & 0x80 != 0 {
-                            println!("[ANALYSIS] WARNING: High bit set! If this is a VarUInt, it indicates continuation.");
-                            println!("[ANALYSIS] If this is a 'Has Custom' flag, it is INVALID (must be 0 or 1).");
-                        }
-                    }
-                }
-                Err(e) => println!("[DEBUG] Failed to read debug buffer: {:?}", e),
-            }
-            
-            panic!("[DEBUG] Forced panic after stream dump to prevent further processing.");
+            info!(?field, ?type_hint, ?options, "deserializing column {i}");
 
             println!("[DEBUG] Protocol Revision: {}", revision);
             if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
