@@ -221,25 +221,31 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
         let _ = deser.with_capacity(columns, rows);
 
         for i in 0..columns {
+            println!("--------------------------------------------------");
+            println!("[DEBUG] Column Index: {}", i);
             let name = reader.read_utf8_string().await?;
+            println!("[DEBUG] Column Name : '{}'", name);
             let type_name = reader.read_utf8_string().await?;
+            println!("[DEBUG] CH Type Raw : '{}'", type_name);
+
             let internal_type = Type::from_str(&type_name)?;
+            println!("[DEBUG] CH Type Internal : '{}'", internal_type);
             let (arrow_type, is_nullable) = internal_type.arrow_type(Some(options))?;
 
             // Verify the resulting type against the arrow type, otherwise the builders will fail
             let type_hint =
                 super::types::normalize_type(&internal_type, &arrow_type).unwrap_or(internal_type);
+            println!("[DEBUG] Type Hint   : {:?}", type_hint);
+            println!("[DEBUG] Arrow Type  : {:?}", arrow_type);
             let field = Field::new(name, arrow_type, is_nullable);
 
-            if debug_arrow() {
-                trace!(?field, ?type_hint, ?options, "deserializing column {i}");
-            }
+            info!(?field, ?type_hint, ?options, "deserializing column {i}");
 
-            let _has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
-                reader.read_u8().await? != 0
-            } else {
-                false
-            };
+            println!("[DEBUG] Protocol Revision: {}", revision);
+            if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
+                let has_custom = reader.read_u8().await?;
+                println!("[DEBUG] Has Custom: {}", has_custom);
+            }
 
             let array = if rows > 0 {
                 let dt = field.data_type();
@@ -253,13 +259,23 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
 
                 let row_buffer = &mut deser.buffer;
                 type_hint.deserialize_prefix_async(reader, &mut prefix_state).await?;
-                type_hint
+                let res = type_hint
                     .deserialize_arrow_async(builder, reader, dt, rows, &[], row_buffer)
                     .await
-                    .inspect_err(|error| error!(?error, ?field, "col {i} deserialize"))?
+                    .inspect_err(|error| error!(?error, ?field, "col {i} deserialize"))?;
+
+                println!("[DEBUG] SUCCESS: Finished reading column '{}'", field.name());
+
+                res
             } else {
                 new_empty_array(field.data_type())
             };
+
+            if let Some(uint_array) = array.as_any().downcast_ref::<UInt64Array>() {
+                if uint_array.len() > 0 {
+                    println!("[DEBUG] Read event_type value: {}", uint_array.value(0));
+                }
+            }
 
             let _ = deser.push_array(array).push_field(Arc::new(field));
         }
