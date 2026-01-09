@@ -246,28 +246,27 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 let has_custom = reader.read_u8().await?;
                 println!("[DEBUG] Has Custom: {}", has_custom);
 
-                let count = 50;
-
-                let mut buf = vec![0u8; count];
-                match reader.read_exact(&mut buf).await {
-                    Ok(_) => {
-                        print!("[HEX-DUMP] ({} bytes): ", count);
-                        for b in &buf {
-                            print!("{:02X} ", b);
-                        }
-                        println!();
-                        // Try to print as string too, just in case
-                        let s = String::from_utf8_lossy(&buf);
-                        println!("[ASCII-DUMP] {}", s);
-                    }
-                    Err(e) => println!("[HEX-DUMP] FAILED: {:?}", e),
-                }
-
                 if has_custom != 0 {
                     tracing::warn!(
-                        "Custom serialization detected for column '{}'. Data might be compressed/sparse.", 
-                        field.name(), 
+                        "Custom serialization detected for column '{}'. Data might be compressed/sparse.",
+                        field.name(),
                     );
+                    let count = 50;
+
+                    let mut buf = vec![0u8; count];
+                    match reader.read_exact(&mut buf).await {
+                        Ok(_) => {
+                            print!("[HEX-DUMP] ({} bytes): ", count);
+                            for b in &buf {
+                                print!("{:02X} ", b);
+                            }
+                            println!();
+                            // Try to print as string too, just in case
+                            let s = String::from_utf8_lossy(&buf);
+                            println!("[ASCII-DUMP] {}", s);
+                        }
+                        Err(e) => println!("[HEX-DUMP] FAILED: {:?}", e),
+                    }
                 }
             }
 
