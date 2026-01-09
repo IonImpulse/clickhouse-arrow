@@ -247,9 +247,8 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 println!("[DEBUG] Has Custom: {}", has_custom);
                 if has_custom != 0 {
                     tracing::warn!(
-                        "Custom serialization detected for column '{}': '{}'. Data might be compressed/sparse.", 
+                        "Custom serialization detected for column '{}'. Data might be compressed/sparse.", 
                         field.name(), 
-                        custom_name
                     );
                 }
             }
