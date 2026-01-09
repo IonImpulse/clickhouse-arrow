@@ -246,7 +246,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 let has_custom = reader.read_u8().await?;
                 println!("[DEBUG] Has Custom: {}", has_custom);
 
-                if has_custom != 0 {
+                if i == 2 {
                     tracing::warn!(
                         "Custom serialization detected for column '{}'. Data might be compressed/sparse.",
                         field.name(),
