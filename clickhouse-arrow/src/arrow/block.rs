@@ -239,8 +239,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             println!("[DEBUG] Arrow Type  : {:?}", arrow_type);
             let field = Field::new(name, arrow_type, is_nullable);
 
-            info!(?field, ?type_hint, ?options, "deserializing column {i}");
-
+            println!("[DEBUG] Is Nullable: {}", is_nullable);
             println!("[DEBUG] Protocol Revision: {}", revision);
             if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 let has_custom = reader.read_u8().await?;
