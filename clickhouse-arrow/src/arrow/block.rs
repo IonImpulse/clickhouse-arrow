@@ -271,12 +271,6 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
                 new_empty_array(field.data_type())
             };
 
-            if let Some(uint_array) = array.as_any().downcast_ref::<UInt64Array>() {
-                if uint_array.len() > 0 {
-                    println!("[DEBUG] Read event_type value: {}", uint_array.value(0));
-                }
-            }
-
             let _ = deser.push_array(array).push_field(Arc::new(field));
         }
 
