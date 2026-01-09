@@ -242,7 +242,7 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             println!("[DEBUG] Is Nullable: {}", is_nullable);
             println!("[DEBUG] Protocol Revision: {}", revision);
             if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
-                let has_custom = reader.read_u8().await?;
+                let has_custom = reader.read_var_uint().await?;
                 println!("[DEBUG] Has Custom: {}", has_custom);
             }
 
