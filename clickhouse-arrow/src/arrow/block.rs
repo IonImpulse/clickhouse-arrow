@@ -302,18 +302,19 @@ impl ProtocolData<RecordBatch, ArrowDeserializerState> for RecordBatch {
             // Verify the resulting type against the arrow type, otherwise the builders will fail
             let type_hint =
                 super::types::normalize_type(&internal_type, &arrow_type).unwrap_or(internal_type);
-            let field = Field::new(name.as_ref(), arrow_type, is_nullable);
-
-            if debug_arrow() {
-                trace!(?field, ?type_hint, ?options, "deserializing column {i}");
-            }
 
             // TODO: Ignored - pass this to prefix deserialization
-            let _has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
+            let has_custom = if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION {
                 reader.try_get_u8()? != 0
             } else {
                 false
             };
+
+            let field = Field::new(name.as_ref(), arrow_type, is_nullable || has_custom);
+
+            if debug_arrow() {
+                trace!(?field, ?type_hint, ?options, "deserializing column {i}");
+            }
 
             let array = if rows > 0 {
                 let dt = field.data_type();
